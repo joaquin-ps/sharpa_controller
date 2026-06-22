@@ -39,10 +39,10 @@ ANGLE_RANGES_DEG = [
     (0, 10),    # Thumb MCP Abduction/Adduction
     (0, 40),    # Thumb DIP Flexion/Extension
 
-    (0, 40),    # (0, 20) # Index MCP Flexion/Extension 
+    (-10, 80),    # (0, 20) # Index MCP Flexion/Extension 
     (-20, 20),  # Index MCP Abduction/Adduction
-    (0, 60),    # (0, 20) # Index PIP Flexion/Extension
-    (0, 60),    # (0, 20) # Index DIP Flexion/Extension
+    (0, 80),    # (0, 20) # Index PIP Flexion/Extension
+    (0, 80),    # (0, 20) # Index DIP Flexion/Extension
 
     (0, 20),    # Middle MCP Flexion/Extension
     (-20, 20),  # Middle MCP Abduction/Adduction
