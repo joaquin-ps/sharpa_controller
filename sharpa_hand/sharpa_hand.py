@@ -68,6 +68,20 @@ class SharpaHand:
         self._latest_state: SharpaJointState | None = None
         self._command_vector = [0.0] * NUM_JOINTS
 
+        # Tactile caching (optional). When enabled the IO thread will fetch
+        # tactile frames and store the most recent content per channel so
+        # callers can read tactile non-blocking via `get_latest_tactile`.
+        self._tactile_enabled = False
+        self._tactile_timeout_s = 0.005
+        self._tactile_channels: dict[str, int] = {}
+        # The sensor only streams ~30 Hz, so we decimate the IO-loop tactile
+        # fetch to this rate instead of fetching every (e.g. 400 Hz) cycle, which
+        # would burden joint streaming for no fresher data.
+        self._tactile_sample_hz = 40.0
+        self._tactile_next_fetch = 0.0
+        # channel -> {"ts": float, "content": dict}
+        self._latest_tactile: dict[int, dict] = {}
+
         self._enabled_mask = [False] * NUM_JOINTS
         self._hold_positions_rad = [0.0] * NUM_JOINTS
 
@@ -208,6 +222,70 @@ class SharpaHand:
             return self._read_state_from_sdk()
         raise RuntimeError("Not connected. Call connect() and start() first.")
 
+    # ----------------- Tactile support (optional IO sampling) -----------------
+    def enable_tactile(
+        self,
+        channels: dict[str, int],
+        timeout_s: float = 0.005,
+        sample_hz: float = 40.0,
+    ) -> bool:
+        """Enable cached tactile sampling on the IO loop.
+
+        channels: map finger name -> tactile channel id (SDK numbering).
+        timeout_s: per-fetch timeout (clamped to IO period in the loop).
+        sample_hz: how often the IO loop fetches tactile. The sensor only streams
+            ~30 Hz, so the default 40 Hz captures every frame without burdening
+            the (e.g. 400 Hz) joint-streaming loop.
+        """
+        if self._hand is None:
+            return False
+        self._tactile_channels = dict(channels)
+        self._tactile_timeout_s = float(timeout_s)
+        self._tactile_sample_hz = float(sample_hz)
+        self._tactile_next_fetch = 0.0
+        self._tactile_enabled = True
+        if self.verbose:
+            print(
+                f"SharpaHand: tactile caching on {self._tactile_channels} "
+                f"@ {self._tactile_sample_hz:.0f} Hz"
+            )
+        return True
+
+    def disable_tactile(self) -> None:
+        """Disable tactile sampling on the IO loop."""
+        self._tactile_enabled = False
+        self._latest_tactile.clear()
+
+    def get_latest_tactile(self, finger: str) -> dict | None:
+        """Return the latest tactile frame content for a finger (or None)."""
+        channel = self._tactile_channels.get(finger)
+        if channel is None:
+            return None
+        return self._latest_tactile.get(channel)
+
+    def tactile_benchmark(self, duration_s: float = 2.0, sample_interval: float = 0.01) -> dict[int, float]:
+        """Benchmark tactile sampling while tactile caching is enabled.
+
+        Returns a mapping channel -> measured_hz (frames per second) observed
+        during the duration. Non-blocking; requires the IO loop to be running and
+        tactile enabled.
+        """
+        if not self._tactile_enabled:
+            raise RuntimeError("Tactile sampling not enabled on this SharpaHand")
+        end = time.time() + float(duration_s)
+        seen: dict[int, set[float]] = {ch: set() for ch in self._tactile_channels.values()}
+        while time.time() < end:
+            for ch in list(self._tactile_channels.values()):
+                entry = self._latest_tactile.get(ch)
+                if entry is not None:
+                    seen[ch].add(entry.get("ts", 0.0))
+            time.sleep(sample_interval)
+        results: dict[int, float] = {}
+        for ch, s in seen.items():
+            count = len(s)
+            results[ch] = count / float(duration_s) if duration_s > 0 else 0.0
+        return results
+
     def _send_command_vector_to_sdk(
         self,
         command_vector: list[float],
@@ -243,6 +321,21 @@ class SharpaHand:
             state = self._read_state_from_sdk()
             with self._state_lock:
                 self._latest_state = state
+            # Cache tactile frames so callers read them non-blocking. Decimated to
+            # ~tactile_sample_hz (sensor is only ~30 Hz).
+            if self._tactile_enabled and cycle_start >= self._tactile_next_fetch:
+                self._tactile_next_fetch = cycle_start + 1.0 / self._tactile_sample_hz
+                try:
+                    timeout = min(self._tactile_timeout_s, period)  # never block > a cycle
+                    for channel in self._tactile_channels.values():
+                        frame = self.hand.fetch_tactile_frame(channel, timeout)
+                        if frame and "content" in frame:
+                            self._latest_tactile[channel] = {
+                                "ts": frame.get("ts", time.time()),
+                                "content": frame["content"],
+                            }
+                except Exception:
+                    pass  # tactile errors must not stop the IO loop
 
             with self._command_lock:
                 command = list(self._command_vector)
